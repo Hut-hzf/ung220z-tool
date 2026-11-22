@@ -1,17 +1,23 @@
 # -*- coding: utf-8 -*-
 """中兴系 webFac 工厂模式 —— 开启 Telnet 并取得登录凭据。
 
-协议来源：对 zteOnu (github.com/idrnyu/zteOnu) 的公开实现做 Python 移植。
+协议来源：对 zteOnu (github.com/idrnyu/zteOnu) 的公开实现做 Python 移植，
+v3（re_rand）握手取自 zte_modem_tools issue #33 的公开讨论。
 流程：
     1. POST webFac      SendSq.gch                 复位
     2. POST webFac      RequestFactoryMode.gch     申请工厂模式
-    3. POST webFac      SendSq.gch?rand=<秒>        取版本与密钥
+    3. POST webFac      SendSq.gch?rand=0           取版本与密钥（v3 只认 rand=0）
     4. POST webFacEntry AES(CheckLoginAuth.gch...)  认证
-       （version=2 时先发 SendInfo.gch，payload 由本机 MAC 反推）
+       （version>=2 时先发 SendInfo.gch；v2 的 payload 由本机 MAC 反推）
     5. POST webFacEntry AES(FactoryMode.gch...)     返回 telnet 账号密码
+
+SendSq 的三种响应决定协议版本：
+    v1  body 为空                    → AES_KEY_POOL，索引 = rand
+    v2  body 以 newrand= 开头        → AES_KEY_POOL_NEW，索引由 rand/newrand 推出
+    v3  body 为 re_rand=<i>&<n>&<mac> → AES_KEY_POOL_RERAND，索引 = i
+                                          （nonce 与 mac 不参与派生）
 """
 import re
-import time
 import urllib.error
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -45,12 +51,30 @@ AES_KEY_POOL_NEW = bytes([
     0x4F, 0x67, 0xEC, 0x97, 0xF4, 0x99,
 ])
 
+# v3：SendSq 返回 re_rand=... 时使用的密钥池（96 字节）
+AES_KEY_POOL_RERAND = bytes([
+    0x9C, 0x33, 0x75, 0xD1, 0x1C, 0x42, 0x45, 0x37, 0x18, 0x48, 0x91, 0x73,
+    0x17, 0x45, 0x79, 0x44, 0x43, 0xD7, 0xD5, 0x73, 0x33, 0x54, 0x76, 0xD2,
+    0xC5, 0xF1, 0x2C, 0x4F, 0x7A, 0xBA, 0x61, 0xD9, 0x5C, 0x69, 0xDF, 0x8C,
+    0xD2, 0x1C, 0xDE, 0x3B, 0x35, 0x2D, 0x2F, 0xE1, 0xDE, 0x4C, 0x77, 0xF5,
+    0x1A, 0x65, 0xD1, 0xFE, 0x18, 0x43, 0x8E, 0xA7, 0x42, 0x08, 0x04, 0x78,
+    0xD5, 0xE4, 0xF3, 0x34, 0xA4, 0xD3, 0xF2, 0x36, 0x47, 0x6D, 0x86, 0x9D,
+    0x42, 0x65, 0x13, 0x42, 0xDC, 0x42, 0x99, 0x48, 0xDC, 0x67, 0x9F, 0x9E,
+    0xDC, 0x46, 0x37, 0x5F, 0x84, 0x9F, 0x6F, 0x76, 0xCE, 0x79, 0x4F, 0x49,
+])
+
 MOD, EXP = 0x9E9, 0x4F8 - 1   # 2537, 1271
 
 
 # ─────────────────────────── 加解密 ───────────────────────────
 def _pad(b):
-    return b + b"\x00" * ((16 - len(b) % 16) % 16)
+    """零填充：总是补满一整块。
+
+    固件侧 httpd 会给明文多分配 1 字节保证 NUL 结尾，所以长度恰为 16 的倍数时
+    也要再补一块（Go 版 padding() 与 C 版一致）。此前按 `len % 16` 取余，
+    这种情况会少补一整块，导致设备解密后取不到结尾的 NUL 而判错。
+    """
+    return b + b"\x00" * (16 - len(b) % 16)
 
 
 def ecb_encrypt(data: bytes, key: bytes) -> bytes:
@@ -70,6 +94,8 @@ def key_pool(version: int, r: int, new_r: int = 0) -> bytes:
     if version == 2:
         idx = ((0x1000193 * r) & 0x3F ^ new_r) % 60
         pool = AES_KEY_POOL_NEW
+    elif version == 3:
+        pool = AES_KEY_POOL_RERAND
     return bytes((b ^ 0xA5) & 0xFF for b in pool[idx:idx + 24])
 
 
@@ -121,12 +147,22 @@ class Factory:
         self.user, self.password = user, password
         self.http = Http("http://%s:%d" % (ip, port), timeout=timeout)
         self.key = b""
+        self.version = 0
 
     def _post_web(self, body):
         return self.http.post("/webFac", body)
 
     def _post_entry(self, plain: bytes):
-        return self.http.post("/webFacEntry", ecb_encrypt(plain, self.key), raw=True)
+        """返回 (响应体, 状态码)。
+
+        urllib 会把 4xx 抛成 HTTPError，若不在这里兜住，
+        check_login_auth 的 401 分支和 send_info 的 400 分支永远走不到，
+        报错会退化成「HTTP Error 401: Unauthorized」，看不出是账号问题还是协议问题。
+        """
+        try:
+            return self.http.post("/webFacEntry", ecb_encrypt(plain, self.key), raw=True)
+        except urllib.error.HTTPError as e:
+            return (e.read() or b""), e.code
 
     def reset(self):
         try:
@@ -136,6 +172,10 @@ class Factory:
         try:
             _, st = self._post_web("SendSq.gch")
         except urllib.error.HTTPError as e:
+            # 400 是「复位就绪」的正常应答：urllib 会把它抛成异常，
+            # 不能当成设备不支持
+            if e.code == 400:
+                return True
             raise RuntimeError("webFac 返回 %d —— 该设备可能不是中兴系，或端口不是 %d"
                                % (e.code, self.port))
         return st in (200, 400)
@@ -148,11 +188,22 @@ class Factory:
         return True
 
     def send_sq(self):
-        r = time.localtime().tm_sec
+        # rand 固定取 0。v3（re_rand）固件对非零 rand 会在后续 webFacEntry 上
+        # 直接断连；v1/v2 的密钥索引由「发送的 rand」与设备回传值共同决定，
+        # 两端看到的值一致，取 0 同样成立。
+        r = 0
         body, st = self._post_web("SendSq.gch?rand=%d\r\n" % r)
         if st != 200 and st != 401:
             return None
-        if "newrand" in body:
+        if "re_rand=" in body:
+            # v3：re_rand=<index>&<nonce>&<device mac>，只有 index 参与派生
+            ver = 3
+            m = re.search(r"re_rand=(\d+)", body)
+            if not m:
+                return None
+            self.key = key_pool(ver, int(m.group(1)))
+            log("DEBUG", "re_rand 索引 = %s" % m.group(1))
+        elif "newrand" in body:
             ver = 2
             new_rand = int(re.sub(r"[^0-9]", "", body.replace("newrand=", "")) or 0)
             self.key = key_pool(ver, r, new_rand)
@@ -161,11 +212,16 @@ class Factory:
             self.key = key_pool(ver, r, 0)
         else:
             return None
+        self.version = ver
         return ver
 
     def check_login_auth(self):
-        cmd = "CheckLoginAuth.gch?&version61&user=%s&pass=%s" % (self.user, self.password)
-        resp, st = self._post_entry(cmd.encode())
+        # v3 固件用 version50，v1/v2 保持 version61（v3 也不再带前导 &）
+        ver_flag = 50 if self.version == 3 else 61
+        sep = "?" if self.version == 3 else "?&"
+        cmd = "CheckLoginAuth.gch%sversion%d&user=%s&pass=%s" % (
+            sep, ver_flag, self.user, self.password)
+        _, st = self._post_entry(cmd.encode())
         if st == 401:
             raise RuntimeError("工厂模式账号密码错误（%s/%s）" % (self.user, self.password))
         if st == 400:
@@ -173,13 +229,17 @@ class Factory:
         return True
 
     def send_info(self, mac_candidates):
-        for mac in mac_candidates:
-            payload = b"SendInfo.gch?info=12|" + magic_bytes(mac)
+        if self.version == 3:
+            # v3 不再提交 MAC 魔数，固定 info=6
+            payloads = [b"SendInfo.gch?info=6|"]
+        else:
+            payloads = [b"SendInfo.gch?info=12|" + magic_bytes(mac) for mac in mac_candidates]
+        for payload in payloads:
             resp, st = self._post_entry(payload)
             if st == 200:
                 return True
-            log("DEBUG", "MAC %s 被拒（%d）" % (":".join("%02x" % b for b in mac), st))
-        raise RuntimeError("所有本机 MAC 均被拒绝")
+            log("DEBUG", "%r 被拒（%d）" % (payload[:24], st))
+        raise RuntimeError("SendInfo 被拒绝")
 
     def factory_mode(self):
         resp, _ = self._post_entry(b"FactoryMode.gch?mode=2&user=notused")
@@ -199,9 +259,10 @@ class Factory:
         ver = self.send_sq()
         if ver is None:
             raise RuntimeError("SendSq 返回异常")
-        log("STEP", "    版本 = %d，密钥已派生" % ver)
+        log("STEP", "    版本 = %d（%s），密钥已派生"
+            % (ver, {1: "空响应", 2: "newrand", 3: "re_rand"}[ver]))
         log("STEP", "[3] 认证")
-        if ver == 2:
+        if ver >= 2:
             self.send_info(macs)
         self.check_login_auth()
         log("STEP", "[4] 进入工厂模式")

@@ -45,16 +45,28 @@ python3 models/b866l1.py   -H 192.168.1.1
 设备在 `http://<ip>:8080` 暴露一个未鉴权的 `webFac` 接口，流程为：
 
 ```
-POST webFac      SendSq.gch                 复位，返回 400 表示就绪
-POST webFac      RequestFactoryMode.gch     申请进入工厂模式
-POST webFac      SendSq.gch?rand=<当前秒>    握手，返回版本与随机数
-POST webFacEntry AES(CheckLoginAuth.gch?user=telecomadmin&pass=nE7jA%5m)
+POST webFac      SendSq.gch                  复位，返回 400 表示就绪
+POST webFac      RequestFactoryMode.gch      申请进入工厂模式（设备主动断连，属正常）
+POST webFac      SendSq.gch?rand=0           握手，响应决定协议版本
+POST webFacEntry AES(SendInfo.gch?info=..|)  v2/v3 先发
+POST webFacEntry AES(CheckLoginAuth.gch?..)  认证
 POST webFacEntry AES(FactoryMode.gch?mode=2) 返回 telnet 账号密码
 ```
 
-- 密钥由 96 字节密钥池按 `rand`（及 `newrand`）切片后异或 `0xA5` 得到 24 字节
-- 通信体为 **AES-ECB + 零填充**
-- 版本 2 的设备还要求先发 `SendInfo.gch`，其 payload 把本机 MAC 编码成 46 字节
+SendSq 的响应形态决定版本与密钥来源：
+
+| 版本 | SendSq 响应 | 密钥池 | 索引 |
+|---|---|---|---|
+| v1 | 空 | `AES_KEY_POOL` | `rand` |
+| v2 | `newrand=<n>` | `AES_KEY_POOL_NEW` | `((0x1000193*rand) & 0x3F ^ n) % 60` |
+| v3 | `re_rand=<i>&<nonce>&<mac>` | `AES_KEY_POOL_RERAND` | `i`（nonce 与 mac 不参与派生） |
+
+- 密钥统一为：从 96 字节池按索引切 24 字节，逐字节异或 `0xA5`
+- 通信体为 **AES-ECB + 零填充**；长度恰为 16 的倍数时也要再补一整块（固件按 NUL 结尾取串）
+- v2 的 `SendInfo.gch?info=12|` 后面跟 46 字节 MAC 魔数；v3 固定 `info=6|` 且不带魔数
+- **v3 固件只接受 `rand=0`**：非零值会让后续 `webFacEntry` 直接断连（ZXHN G7615TV2 / V3.1.0P1T1 实测）
+- 认证用的是设备**当前**的管理员口令。`CheckLoginAuth` 返回 401 就是口令不对，不是协议问题
+- 拿到凭据不等于 Telnet 已放开：新固件还要过 `setTelnetPri`（按 PON MAC + 索引生成的授权串）和 `PortControl`，重启或重新拨号会清掉授权位
 
 ### 2. SendInfo 的数学
 
