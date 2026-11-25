@@ -194,6 +194,16 @@ def _local_macs():
                 continue
     except ImportError:
         pass          # Windows / macOS 没有 fcntl
+    if not macs and sys.platform == "win32":
+        try:
+            import subprocess
+            out = subprocess.check_output(["getmac", "/fo", "csv", "/nh"], text=True, stderr=subprocess.DEVNULL)
+            for m in re.findall(r"([0-9A-Fa-f]{2}(?:-[0-9A-Fa-f]{2}){5})", out):
+                b = bytes.fromhex(m.replace("-", ""))
+                if b != b"\x00" * 6 and b not in macs:
+                    macs.append(b)
+        except Exception:
+            pass
     if not macs:
         try:
             import uuid
