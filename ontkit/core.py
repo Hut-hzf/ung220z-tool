@@ -5,6 +5,7 @@ import re
 import select
 import socket
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -43,11 +44,17 @@ class Http:
         self.op.addheaders = [("User-Agent", UA), ("Referer", self.base + "/")]
 
     def get(self, path, raw=False):
-        with self.op.open(self.base + path, timeout=self.timeout) as r:
-            data = r.read()
+        try:
+            with self.op.open(self.base + path, timeout=self.timeout) as r:
+                data = r.read()
+                if raw:
+                    return data, r.status
+                return decode_body(data, r.headers.get("Content-Type", "")), r.status
+        except urllib.error.HTTPError as e:
+            data = e.read() or b""
             if raw:
-                return data, r.status
-            return decode_body(data, r.headers.get("Content-Type", "")), r.status
+                return data, e.code
+            return decode_body(data, (e.headers or {}).get("Content-Type", "")), e.code
 
     def post(self, path, body, raw=False, ctype=None):
         if isinstance(body, str):
@@ -55,11 +62,17 @@ class Http:
         req = urllib.request.Request(self.base + path, data=body)
         if ctype:
             req.add_header("Content-Type", ctype)
-        with self.op.open(req, timeout=self.timeout) as r:
-            data = r.read()
+        try:
+            with self.op.open(req, timeout=self.timeout) as r:
+                data = r.read()
+                if raw:
+                    return data, r.status
+                return decode_body(data, r.headers.get("Content-Type", "")), r.status
+        except urllib.error.HTTPError as e:
+            data = e.read() or b""
             if raw:
-                return data, r.status
-            return decode_body(data, r.headers.get("Content-Type", "")), r.status
+                return data, e.code
+            return decode_body(data, (e.headers or {}).get("Content-Type", "")), e.code
 
     def post_form(self, path, data):
         return self.post(path, urllib.parse.urlencode(data), ctype="application/x-www-form-urlencoded")
