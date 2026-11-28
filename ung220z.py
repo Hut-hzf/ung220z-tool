@@ -151,7 +151,7 @@ def unlock_web(ip, tn):
     return False
 
 
-def enable_telnet(ip, user, pw, open_browser=True):
+def enable_telnet(ip, user, pw, open_browser=True, timeout=8):
     base = "http://%s/" % ip
     # 口令里的 % & # ? + 空格 必须先百分号编码，否则服务器会返回 400 Bad Request
     # （社区实测：aDm8H%MdA 必须写成 aDm8H%25MdA）
@@ -172,7 +172,7 @@ def enable_telnet(ip, user, pw, open_browser=True):
     missing = False
     for url in variants:
         try:
-            body = http_get(url)
+            body = http_get(url, timeout=timeout)
         except urllib.error.HTTPError as e:
             if e.code == 404:
                 missing = True
